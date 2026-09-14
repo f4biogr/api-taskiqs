@@ -1,0 +1,196 @@
+{
+  "metadata": {
+    "exportedAt": "2026-09-12T21:43:29.167Z",
+    "sourceFolder": "tasks",
+    "totalFiles": 12,
+    "totalSize": 27627,
+    "totalLines": 780,
+    "estimatedTokens": 6910,
+    "extensions": ["py"],
+    "version": "1.0",
+    "dependencies": {
+      "msisdn/tasks.py": [],
+      "regular_campaign/retry.py": [],
+      "regular_campaign/tasks.py": [],
+      "reports/tasks.py": [],
+      "scheduler.py": [],
+      "worker.py": [],
+      "core/worker_bootstrap.py": [],
+      "faststream_app.py": [],
+      "regular_campaign/workflow.py": [],
+      "core/batching.py": [],
+      "regular_campaign/constants.py": [],
+      "__init__.py": []
+    }
+  },
+  "files": [
+    {
+      "path": "msisdn/tasks.py",
+      "extension": "py",
+      "content": "from geoloc_connector.core.logger import app_logger\n\nfrom geoloc_connector.services.file_service import FileService\n\nfrom tasks.faststream_app import MSISDN_QUEUE, broker\n\n\ndef get_file_service() -> FileService:\n    return FileService()\n\n\n@broker.subscriber(\n    MSISDN_QUEUE,\n)\nasync def process_msisdn_file(payload: dict[str, str]) -> str:\n    file_url = payload[\"file_url\"]\n    list_id = payload[\"list_id\"]\n    tenant_id = payload[\"tenant_id\"]\n\n    app_logger.info(\"msisdn_file_task_start\", file_url=file_url, list_id=list_id, tenant_id=tenant_id)\n\n    try:\n        service = get_file_service()\n\n        total_lines = await service.process_msisdn_file_from_minio(\n            file_url=file_url, list_id=list_id, tenant_id=tenant_id\n        )\n\n        app_logger.info(\n            \"msisdn_file_task_success\",\n            file_url=file_url, list_id=list_id, tenant_id=tenant_id, total_lines=total_lines\n        )\n        return f\"File processed with list_id: {list_id}, lines: {total_lines}\"\n    except Exception:\n        app_logger.error(\n            \"msisdn_file_task_failed\",\n            exc_info=True, file_url=file_url, list_id=list_id, tenant_id=tenant_id\n        )\n        raise\n",
+      "size": 1162,
+      "lines": 37,
+      "tokens": 291,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "regular_campaign/retry.py",
+      "extension": "py",
+      "content": "from datetime import UTC, datetime, timedelta\n\nfrom geoloc_lib.repository.regular_campaign_execution_repository import (\n    RegularCampaignExecutionRepository,\n)\nfrom geoloc_lib.schemas.regular_campaign_schema import (\n    RegularCampaignExecutionReason,\n    RegularCampaignExecutionStatus,\n    RegularCampaignExecutionUpdate,\n)\nfrom geoloc_connector.core.logger import app_logger\n\nfrom geoloc_connector.settings import settings\nfrom tasks.faststream_app import REGULAR_CAMPAIGN_QUEUE, broker\n\n\nasync def retry_failed_dispatches(*, now: datetime | None = None) -> str:\n    reference = now or datetime.now(UTC)\n    repository = RegularCampaignExecutionRepository()\n\n    app_logger.info(\n        \"regular_campaign_dispatch_retry_start\",\n        reference=reference,\n        limit=settings.REGULAR_CAMPAIGN_DISPATCH_RETRY_BATCH_SIZE,\n    )\n    executions = await repository.find_dispatch_retry_candidates(\n        now=reference,\n        limit=settings.REGULAR_CAMPAIGN_DISPATCH_RETRY_BATCH_SIZE,\n    )\n    app_logger.info(\n        \"regular_campaign_dispatch_retry_candidates_found\",\n        reference=reference,\n        candidate_count=len(executions),\n    )\n\n    retried = 0\n    moved_to_dlq = 0\n    for execution in executions:\n        age = reference - execution.created_at\n        retry_exhausted = execution.dispatch_attempts > settings.REGULAR_CAMPAIGN_DISPATCH_MAX_RETRIES\n\n        age_exhausted = age >= timedelta(seconds=settings.REGULAR_CAMPAIGN_DISPATCH_MAX_AGE_SECONDS)\n        app_logger.info(\n            \"regular_campaign_dispatch_retry_candidate_evaluated\",\n            campaign_id=execution.campaign_id,\n            execution_id=execution.execution_id,\n            tenant_id=execution.tenant_id,\n            dispatch_attempts=execution.dispatch_attempts,\n            age_seconds=age.total_seconds(),\n            retry_exhausted=retry_exhausted,\n            age_exhausted=age_exhausted,\n        )\n        if retry_exhausted or age_exhausted:\n            await repository.update_execution(\n                execution.execution_id,\n                execution.tenant_id,\n                RegularCampaignExecutionUpdate(\n                    status=RegularCampaignExecutionStatus.DLQ,\n                    status_reason=RegularCampaignExecutionReason.DISPATCH_RETRY_EXHAUSTED,\n                    finished_at=reference,\n                ),\n            )\n            moved_to_dlq += 1\n            app_logger.error(\n                \"regular_campaign_dispatch_dlq\",\n                campaign_id=execution.campaign_id,\n                execution_id=execution.execution_id,\n                tenant_id=execution.tenant_id,\n                dispatch_attempts=execution.dispatch_attempts,\n            )\n            continue\n\n        await broker.publish(\n            {\n                \"campaign_id\": execution.campaign_id,\n                \"execution_id\": execution.execution_id,\n                \"tenant_id\": execution.tenant_id,\n            },\n            queue=REGULAR_CAMPAIGN_QUEUE,\n        )\n        await repository.update_execution(\n            execution.execution_id,\n            execution.tenant_id,\n            RegularCampaignExecutionUpdate(\n                status=RegularCampaignExecutionStatus.PENDING_DISPATCH,\n                status_reason=None,\n                dispatch_attempts=execution.dispatch_attempts + 1,\n                next_retry_at=reference,\n            ),\n        )\n        retried += 1\n        app_logger.info(\n            \"regular_campaign_dispatch_retried\",\n            campaign_id=execution.campaign_id,\n            execution_id=execution.execution_id,\n            tenant_id=execution.tenant_id,\n            dispatch_attempts=execution.dispatch_attempts + 1,\n        )\n\n    app_logger.info(\n        \"regular_campaign_dispatch_retry_finished\",\n        reference=reference,\n        retried=retried,\n        dlq=moved_to_dlq,\n    )\n    return f\"retried={retried} dlq={moved_to_dlq}\"\n",
+      "size": 3904,
+      "lines": 107,
+      "tokens": 976,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "regular_campaign/tasks.py",
+      "extension": "py",
+      "content": "from tasks.faststream_app import REGULAR_CAMPAIGN_QUEUE, REGULAR_CAMPAIGN_RETRY_QUEUE, broker\n\nfrom tasks.regular_campaign.retry import retry_failed_dispatches\n\nfrom tasks.regular_campaign.workflow import RegularCampaignExecutionWorkflow\n\n\n@broker.subscriber(\n    REGULAR_CAMPAIGN_QUEUE,\n)\nasync def run_regular_campaign_execution(payload: dict[str, str]) -> str:\n    campaign_id = payload[\"campaign_id\"]\n    execution_id = payload[\"execution_id\"]\n    tenant_id = payload[\"tenant_id\"]\n\n    workflow = RegularCampaignExecutionWorkflow()\n\n    return await workflow.execute(campaign_id=campaign_id, execution_id=execution_id, tenant_id=tenant_id)\n\n\n@broker.subscriber(\n    REGULAR_CAMPAIGN_RETRY_QUEUE,\n)\nasync def retry_failed_regular_campaign_dispatches() -> str:\n    return await retry_failed_dispatches()\n",
+      "size": 803,
+      "lines": 23,
+      "tokens": 201,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "reports/tasks.py",
+      "extension": "py",
+      "content": "from geoloc_connector.core.logger import app_logger\n\nfrom geoloc_connector.services.report_service import ReportService\n\nfrom tasks.faststream_app import REPORTS_DAILY_QUEUE, REPORTS_HOURLY_QUEUE, REPORTS_MESSAGE_QUEUE, broker\n\n\ndef get_report_service() -> ReportService:\n    return ReportService()\n\n\n@broker.subscriber(\n    REPORTS_HOURLY_QUEUE,\n)\nasync def generate_hourly_report_task() -> str:\n    try:\n        report_service = get_report_service()\n        return await report_service.generate_hourly_report()\n    except Exception:\n        app_logger.error(\"hourly_report_error\", exc_info=True)\n        raise\n\n\n@broker.subscriber(\n    REPORTS_DAILY_QUEUE,\n)\nasync def generate_daily_report_task() -> str:\n    try:\n        report_service = get_report_service()\n        return await report_service.generate_daily_report()\n    except Exception:\n        app_logger.error(\"daily_report_error\", exc_info=True)\n        raise\n\n\n@broker.subscriber(\n    REPORTS_MESSAGE_QUEUE,\n)\nasync def generate_message_report_task() -> str:\n    try:\n        report_service = get_report_service()\n        return await report_service.generate_message_report()\n    except Exception:\n        app_logger.error(\"message_report_error\", exc_info=True)\n        raise\n",
+      "size": 1236,
+      "lines": 44,
+      "tokens": 309,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "scheduler.py",
+      "extension": "py",
+      "content": "from apscheduler.schedulers.asyncio import AsyncIOScheduler\n\nfrom apscheduler.triggers.cron import CronTrigger\n\nfrom geoloc_connector.core.logger import app_logger\n\nfrom tasks.faststream_app import (\n    REGULAR_CAMPAIGN_RETRY_QUEUE,\n    REPORTS_DAILY_QUEUE,\n    REPORTS_HOURLY_QUEUE,\n    REPORTS_MESSAGE_QUEUE,\n    broker,\n)\n\nscheduler = AsyncIOScheduler()\n\n\nasync def _trigger_hourly_report() -> None:\n    await broker.publish({\"trigger\": \"generate_hourly_report\"}, queue=REPORTS_HOURLY_QUEUE)\n\n\nasync def _trigger_daily_report() -> None:\n    await broker.publish({\"trigger\": \"generate_daily_report\"}, queue=REPORTS_DAILY_QUEUE)\n\n\nasync def _trigger_message_report() -> None:\n    await broker.publish({\"trigger\": \"generate_message_report\"}, queue=REPORTS_MESSAGE_QUEUE)\n\n\nasync def _trigger_retry_failed_dispatches() -> None:\n    await broker.publish({\"trigger\": \"retry_failed_regular_campaign_dispatches\"}, queue=REGULAR_CAMPAIGN_RETRY_QUEUE)\n\n\ndef register_scheduled_jobs() -> None:\n    scheduler.add_job(\n        _trigger_hourly_report, CronTrigger(minute=\"*/1\"), id=\"generate_hourly_report\", replace_existing=True\n    )\n    scheduler.add_job(\n        _trigger_daily_report, CronTrigger(minute=\"*/1\"), id=\"generate_daily_report\", replace_existing=True\n    )\n    scheduler.add_job(\n        _trigger_message_report, CronTrigger(minute=\"*/1\"), id=\"generate_message_report\", replace_existing=True\n    )\n    scheduler.add_job(\n        _trigger_retry_failed_dispatches,\n        CronTrigger(minute=\"*/1\"),\n        id=\"retry_failed_regular_campaign_dispatches\",\n        replace_existing=True,\n    )\n    app_logger.info(\"scheduler_jobs_registered\")\n",
+      "size": 1646,
+      "lines": 52,
+      "tokens": 412,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "worker.py",
+      "extension": "py",
+      "content": "from faststream import FastStream\n\nfrom geoloc_connector.core.database import init_db\n\nfrom geoloc_connector.core.logger import app_logger\n\n\nfrom tasks.core.worker_bootstrap import register_worker_bootstrap\n\nfrom tasks.faststream_app import app\nfrom tasks.scheduler import register_scheduled_jobs, scheduler\n\nregister_worker_bootstrap(app)\n\n\n@app.after_startup\nasync def start_scheduler() -> None:\n    try:\n        register_scheduled_jobs()\n        scheduler.start()\n        app_logger.info(\"scheduler_started_success\")\n        for job in scheduler.get_jobs():\n            app_logger.info(\n                \"scheduler_job_registered\",\n                id=job.id,\n                next_run=str(job.next_run_time),\n            )\n    except Exception:\n        app_logger.error(\"error_on_startup\", exc_info=True)\n\n\n@app.on_shutdown\nasync def stop_scheduler() -> None:\n    try:\n        scheduler.shutdown(wait=False)\n        app_logger.info(\"scheduler_shutdown_success\")\n    except Exception:\n        app_logger.error(\"error_on_shutdown\", exc_info=True)\n",
+      "size": 956,
+      "lines": 32,
+      "tokens": 239,
+      "modified": "2026-09-12T18:46:48.389Z"
+    },
+    {
+      "path": "core/worker_bootstrap.py",
+      "extension": "py",
+      "content": "from faststream import FastStream\n\nfrom geoloc_connector.core.database import init_db\n\nfrom geoloc_connector.core.logger import app_logger\n\n\ndef register_worker_bootstrap(app: FastStream) -> None:\n    @app.on_startup\n    async def init_worker_database() -> None:\n        try:\n            await init_db()\n            app_logger.info(\"worker_database_init_success\")\n        except Exception:\n            app_logger.error(\"worker_database_init_failed\", exc_info=True)\n            raise\n",
+      "size": 482,
+      "lines": 16,
+      "tokens": 121,
+      "modified": "2026-09-12T18:46:48.388Z"
+    },
+    {
+      "path": "faststream_app.py",
+      "extension": "py",
+      "content": "from faststream import FastStream\nfrom faststream.rabbit import RabbitBroker, RabbitQueue\n\nfrom geoloc_connector.settings import settings\n\nbroker = RabbitBroker(settings.CELERY_BROKER_URL)\n\napp = FastStream(broker)\n\nMSISDN_QUEUE = RabbitQueue(\"msisdn.process\", routing_key=\"msisdn.process\")\nREGULAR_CAMPAIGN_QUEUE = RabbitQueue(\"campaign.exec\", routing_key=\"campaign.exec\")\nREGULAR_CAMPAIGN_RETRY_QUEUE = RabbitQueue(\"campaign.retry\", routing_key=\"campaign.retry\")\nREPORTS_DAILY_QUEUE = RabbitQueue(\"reports.daily\", routing_key=\"reports.daily\")\nREPORTS_HOURLY_QUEUE = RabbitQueue(\"reports.hourly\", routing_key=\"reports.hourly\")\nREPORTS_MESSAGE_QUEUE = RabbitQueue(\"reports.message\", routing_key=\"reports.message\")\n",
+      "size": 714,
+      "lines": 16,
+      "tokens": 179,
+      "modified": "2026-09-12T18:46:48.388Z"
+    },
+    {
+      "path": "regular_campaign/workflow.py",
+      "extension": "py",
+      "content": "import httpx\nfrom geoloc_lib.repository.campaign_repository import CampaignRepository\n\nfrom geoloc_lib.schemas.regular_campaign_schema import (\n    RegularCampaignBatchStatus,\n    RegularCampaignExecutionReason,\n    RegularCampaignExecutionStatus,\n)\nfrom geoloc_connector.core.logger import app_logger\n\nfrom geoloc_connector.services.regular_campaign_clients import (\n    MessagingClient,\n    SegmentationClient,\n    SegmentationStreamError,\n)\nfrom geoloc_connector.services.regular_campaign_service import RegularCampaignService\nfrom geoloc_connector.settings import settings\nfrom tasks.regular_campaign.constants import PAUSE_REASONS\n\n\nclass RegularCampaignExecutionWorkflow:\n    def determine_final_status(\n        self,\n        *,\n        stopped_reason: RegularCampaignExecutionReason | None,\n        had_failures: bool,\n    ) -> RegularCampaignExecutionStatus:\n        if stopped_reason == RegularCampaignExecutionReason.CAMPAIGN_TERMINATED:\n            return RegularCampaignExecutionStatus.CANCELED\n        if stopped_reason in PAUSE_REASONS:\n            return RegularCampaignExecutionStatus.PAUSED\n        if had_failures:\n            return RegularCampaignExecutionStatus.PARTIAL_FAILED\n        return RegularCampaignExecutionStatus.COMPLETED\n\n    def _stop_reason_for_campaign_status(self, campaign_status: str) -> RegularCampaignExecutionReason:\n        if campaign_status == \"terminated\":\n            return RegularCampaignExecutionReason.CAMPAIGN_TERMINATED\n        return RegularCampaignExecutionReason.CAMPAIGN_PAUSED\n\n    async def execute(\n        self,\n        campaign_id: str,\n        execution_id: str,\n        tenant_id: str,\n    ) -> str:\n        service = RegularCampaignService()\n        campaign_repository = CampaignRepository()\n\n        app_logger.info(\n            \"regular_campaign_execution_start\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n        )\n\n        execution = await service.execution_repository.get_by_execution_id(execution_id, tenant_id)\n\n        if execution is None or execution.snapshot is None:\n            app_logger.error(\n                \"regular_campaign_execution_missing\",\n                campaign_id=campaign_id,\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n            )\n            return f\"execution {execution_id} not found or missing snapshot\"\n\n        app_logger.info(\n            \"regular_campaign_execution_loaded\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            requested_quota=execution.requested_quota,\n            requested_count=execution.requested_count,\n            accepted_count=execution.accepted_count,\n            failed_count=execution.failed_count,\n        )\n\n        campaign = await campaign_repository.get_campaign_by_id(campaign_id, tenant_id)\n        if campaign is None:\n            await service.update_execution(\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n                status=RegularCampaignExecutionStatus.FAILED,\n                status_reason=RegularCampaignExecutionReason.SEGMENTATION_ERROR,\n            )\n            app_logger.error(\n                \"regular_campaign_campaign_missing\", campaign_id=campaign_id, execution_id=execution_id\n            )\n            return f\"campaign {campaign_id} not found\"\n\n        app_logger.info(\n            \"regular_campaign_campaign_loaded\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            campaign_status=campaign.status,\n        )\n\n        if not service.is_campaign_active_for_sending(campaign.status):\n            stopped_reason = self._stop_reason_for_campaign_status(campaign.status)\n\n            status = (\n                RegularCampaignExecutionStatus.CANCELED\n                if campaign.status == \"terminated\"\n                else RegularCampaignExecutionStatus.PAUSED\n            )\n            app_logger.info(\n                \"regular_campaign_execution_stopped_before_send\",\n                campaign_id=campaign_id,\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n                campaign_status=campaign.status,\n                status=status,\n                status_reason=stopped_reason,\n            )\n            await service.update_execution(\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n                status=status,\n            )\n            return f\"campaign {campaign_id} is not active for sending\"\n\n        snapshot = execution.snapshot\n\n        if not service.is_within_allowed_window(snapshot.allowed_times):\n            app_logger.info(\n                \"regular_campaign_execution_outside_allowed_window\",\n                campaign_id=campaign_id,\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n            )\n\n            await service.update_execution(\n                execution_id=execution_id,\n                tenant_id=tenant_id,\n                status=RegularCampaignExecutionStatus.PAUSED,\n                status_reason=RegularCampaignExecutionReason.OUTSIDE_ALLOWED_WINDOW,\n            )\n            return f\"execution {execution_id} is outside its allowed window\"\n\n        await service.update_execution(\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            status=RegularCampaignExecutionStatus.RUNNING,\n        )\n\n        app_logger.info(\n            \"regular_campaign_execution_running\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n        )\n\n        segmentation_client = SegmentationClient(\n            base_url=settings.SEGMENTATION_API_URL,\n            api_key=settings.SEGMENTATION_API_KEY,\n            api_key_id=settings.SEGMENTATION_API_KEY_ID,\n            timeout_seconds=settings.REGULAR_CAMPAIGN_STREAM_TIMEOUT_SECONDS,\n        )\n        messaging_client = MessagingClient(\n            base_url=settings.MESSAGE_SEND_API_URL,\n            api_key=settings.MESSAGE_SEND_API_KEY,\n            api_key_id=settings.MESSAGE_SEND_API_KEY_ID,\n            timeout_seconds=settings.REGULAR_CAMPAIGN_SEND_TIMEOUT_SECONDS,\n        )\n        app_logger.info(\n            \"regular_campaign_clients_initialized\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            segmentation_base_url=settings.SEGMENTATION_API_URL,\n            messaging_base_url=settings.MESSAGE_SEND_API_URL,\n        )\n\n        remaining_quota = execution.requested_quota - execution.accepted_count\n        requested_count = execution.requested_count\n        accepted_count = execution.accepted_count\n        failed_count = execution.failed_count\n        batch_index = 0\n        had_failures = False\n        stopped_reason: RegularCampaignExecutionReason | None = None\n\n        app_logger.info(\n            \"regular_campaign_quota_initialized\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            remaining_quota=remaining_quota,\n            requested_count=requested_count,\n            accepted_count=accepted_count,\n            failed_count=failed_count,\n        )\n\n        try:\n            payload = service.build_segmentation_request(snapshot, remaining_quota=remaining_quota)\n\n            async for chunk in segmentation_client.iter_msisdn_chunks(payload):\n                app_logger.info(\n                    \"regular_campaign_segmentation_chunk_processing\",\n                    campaign_id=campaign_id,\n                    execution_id=execution_id,\n                    tenant_id=tenant_id,\n                    batch_index=batch_index,\n                    chunk_msisdn_count=len(chunk),\n                    remaining_quota=remaining_quota,\n                )\n                if remaining_quota <= 0:\n                    stopped_reason = RegularCampaignExecutionReason.QUOTA_EXHAUSTED\n                    app_logger.info(\n                        \"regular_campaign_execution_quota_exhausted\",\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        tenant_id=tenant_id,\n                        batch_index=batch_index,\n                    )\n                    break\n\n                campaign = await campaign_repository.get_campaign_by_id(campaign_id, tenant_id)\n\n                app_logger.info(\n                    \"regular_campaign_campaign_rechecked\",\n                    campaign_id=campaign_id,\n                    execution_id=execution_id,\n                    tenant_id=tenant_id,\n                    batch_index=batch_index,\n                    campaign_status=campaign.status if campaign else None,\n                )\n\n                if campaign is None or not service.is_campaign_active_for_sending(campaign.status):\n                    stopped_reason = self._stop_reason_for_campaign_status(\n                        campaign.status if campaign else \"terminated\"\n                    )\n                    app_logger.info(\n                        \"regular_campaign_execution_stopped_during_send\",\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        tenant_id=tenant_id,\n                        batch_index=batch_index,\n                        campaign_status=campaign.status if campaign else None,\n                        status_reason=stopped_reason,\n                    )\n                    break\n\n                if not service.is_within_allowed_window(snapshot.allowed_times):\n                    stopped_reason = RegularCampaignExecutionReason.OUTSIDE_ALLOWED_WINDOW\n                    app_logger.info(\n                        \"regular_campaign_execution_window_closed_during_send\",\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        tenant_id=tenant_id,\n                        batch_index=batch_index,\n                    )\n                    break\n\n                msisdns = service.dedupe_batch(chunk)\n\n                msisdns = service.shrink_batch_to_quota(msisdns, remaining_quota=remaining_quota)\n\n                if not msisdns:\n                    app_logger.info(\n                        \"regular_campaign_batch_skipped_empty\",\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        tenant_id=tenant_id,\n                        batch_index=batch_index,\n                        chunk_msisdn_count=len(chunk),\n                    )\n                    continue\n\n                app_logger.info(\n                    \"regular_campaign_batch_prepared\",\n                    campaign_id=campaign_id,\n                    execution_id=execution_id,\n                    tenant_id=tenant_id,\n                    batch_index=batch_index,\n                    chunk_msisdn_count=len(chunk),\n                    msisdn_count=len(msisdns),\n                    remaining_quota=remaining_quota,\n                )\n\n                requested_count += len(msisdns)\n                await service.record_batch(\n                    execution_id=execution_id,\n                    campaign_id=campaign_id,\n                    batch_index=batch_index,\n                    msisdns=msisdns,\n                    tenant_id=tenant_id,\n                )\n\n                idempotency_key = service.compute_idempotency_key(\n                    campaign_id=campaign_id, execution_id=execution_id, batch_index=batch_index\n                )\n                app_logger.info(\n                    \"regular_campaign_batch_recorded\",\n                    campaign_id=campaign_id,\n                    execution_id=execution_id,\n                    tenant_id=tenant_id,\n                    batch_index=batch_index,\n                    idempotency_key=idempotency_key,\n                    msisdn_count=len(msisdns),\n                )\n                try:\n                    response = await messaging_client.send_batch(\n                        campaign_id=campaign_id,\n                        msisdns=msisdns,\n                        idempotency_key=idempotency_key,\n                    )\n                except httpx.HTTPStatusError as exc:\n                    failed_count += len(msisdns)\n                    had_failures = True\n                    await service.mark_batch_result(\n                        execution_id=execution_id,\n                        batch_index=batch_index,\n                        tenant_id=tenant_id,\n                        status=RegularCampaignBatchStatus.FAILED,\n                        attempt_count=1,\n                        failed_count=len(msisdns),\n                        http_status=exc.response.status_code,\n                        error_message=str(exc),\n                    )\n                    app_logger.error(\n                        \"regular_campaign_batch_send_error\",\n                        exc_info=True,\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        batch_index=batch_index,\n                    )\n                else:\n                    accepted_count += len(msisdns)\n\n                    remaining_quota -= len(msisdns)\n\n                    await service.mark_batch_result(\n                        execution_id=execution_id,\n                        batch_index=batch_index,\n                        tenant_id=tenant_id,\n                        status=RegularCampaignBatchStatus.ACCEPTED,\n                        attempt_count=1,\n                        accepted_count=len(msisdns),\n                        http_status=response.status_code,\n                    )\n                    app_logger.info(\n                        \"regular_campaign_batch_sent\",\n                        campaign_id=campaign_id,\n                        execution_id=execution_id,\n                        batch_index=batch_index,\n                        batch_size=len(msisdns),\n                    )\n\n                batch_index += 1\n        except SegmentationStreamError as exc:\n            had_failures = True\n            stopped_reason = RegularCampaignExecutionReason.SEGMENTATION_ERROR\n            app_logger.error(\n                \"regular_campaign_segmentation_contract_error\",\n                exc_info=True,\n                campaign_id=campaign_id,\n                execution_id=execution_id,\n                error=str(exc),\n            )\n        finally:\n            await segmentation_client.aclose()\n            await messaging_client.aclose()\n\n        final_status = (\n            RegularCampaignExecutionStatus.FAILED\n            if stopped_reason == RegularCampaignExecutionReason.SEGMENTATION_ERROR\n            else self.determine_final_status(stopped_reason=stopped_reason, had_failures=had_failures)\n        )\n\n        await service.update_execution(\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            status=final_status,\n            status_reason=stopped_reason,\n            requested_count=requested_count,\n            accepted_count=accepted_count,\n            failed_count=failed_count,\n        )\n\n        app_logger.info(\n            \"regular_campaign_execution_finished\",\n            campaign_id=campaign_id,\n            execution_id=execution_id,\n            tenant_id=tenant_id,\n            status=final_status,\n            requested_count=requested_count,\n            accepted_count=accepted_count,\n            failed_count=failed_count,\n        )\n        return f\"execution {execution_id} finished as {final_status}\"\n",
+      "size": 15747,
+      "lines": 417,
+      "tokens": 3937,
+      "modified": "2026-09-12T18:35:44.230Z"
+    },
+    {
+      "path": "core/batching.py",
+      "extension": "py",
+      "content": "from typing import Iterable, Iterator, TypeVar\n\nT = TypeVar(\"T\")\n\ndef chunked(iterable: Iterable[T], size: int) -> Iterator[list[T]]:\n    if size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n\n    batch: list[T] = []\n    for item in iterable:\n        batch.append(item)\n        if len(batch) >= size:\n            yield batch\n            batch = []\n    if batch:\n        yield batch\n",
+      "size": 403,
+      "lines": 18,
+      "tokens": 101,
+      "modified": "2026-09-12T18:22:15.861Z"
+    },
+    {
+      "path": "regular_campaign/constants.py",
+      "extension": "py",
+      "content": "from geoloc_lib.schemas.regular_campaign_schema import (\n    RegularCampaignExecutionReason,\n)\n\nPAUSE_REASONS = {\n    RegularCampaignExecutionReason.OUTSIDE_ALLOWED_WINDOW,\n    RegularCampaignExecutionReason.CAMPAIGN_PAUSED,\n    RegularCampaignExecutionReason.QUOTA_EXHAUSTED,\n}\n",
+      "size": 280,
+      "lines": 11,
+      "tokens": 70,
+      "modified": "2026-09-12T18:22:15.861Z"
+    },
+    {
+      "path": "__init__.py",
+      "extension": "py",
+      "content": "from tasks.core import worker_bootstrap\nfrom tasks.msisdn import tasks as msisdn_tasks\nfrom tasks.regular_campaign import tasks as regular_campaign_tasks\n\nfrom tasks.reports import tasks as reports_tasks\n\n__all__ = [\"worker_bootstrap\", \"msisdn_tasks\", \"reports_tasks\", \"regular_campaign_tasks\"]\n",
+      "size": 294,
+      "lines": 7,
+      "tokens": 74,
+      "modified": "2026-09-12T18:22:15.860Z"
+    }
+  ],
+  "contextSummary": {
+    "preset": "ai-pack",
+    "formatVersion": "1.0",
+    "tokenBudget": 100000,
+    "includedCount": 12,
+    "excludedCount": 4,
+    "included": [
+      { "path": "msisdn/tasks.py", "reason": "included" },
+      { "path": "regular_campaign/retry.py", "reason": "included" },
+      { "path": "regular_campaign/tasks.py", "reason": "included" },
+      { "path": "reports/tasks.py", "reason": "included" },
+      { "path": "scheduler.py", "reason": "included" },
+      { "path": "worker.py", "reason": "included" },
+      { "path": "core/worker_bootstrap.py", "reason": "included" },
+      { "path": "faststream_app.py", "reason": "included" },
+      { "path": "regular_campaign/workflow.py", "reason": "included" },
+      { "path": "core/batching.py", "reason": "included" },
+      { "path": "regular_campaign/constants.py", "reason": "included" },
+      { "path": "__init__.py", "reason": "included" }
+    ],
+    "excluded": [
+      { "path": "regular_campaign/__init__.py", "reason": "empty" },
+      { "path": "reports/__init__.py", "reason": "empty" },
+      { "path": "core/__init__.py", "reason": "empty" },
+      { "path": "msisdn/__init__.py", "reason": "empty" }
+    ],
+    "selectionNotes": [
+      "Entry points and recent files prioritized",
+      "Token budget enforced",
+      "Comments removed and whitespace minified",
+      "Large files truncated by line limit"
+    ],
+    "promptTemplate": "You are an AI assistant working on the project \"tasks\".\nContext: 12 files included, 4 excluded.\nToken budget: 100000.\n\n\nPriority files:\nmsisdn/tasks.py\nregular_campaign/__init__.py\nregular_campaign/retry.py\nregular_campaign/tasks.py\nreports/__init__.py\nreports/tasks.py\nscheduler.py\nworker.py\ncore/__init__.py\ncore/worker_bootstrap.py\n\nInstructions:\n1) Use the provided files as the single source of truth.\n\n2) If anything is missing, ask for the specific file/path.\n\n3) Provide concise, actionable output with code references.\n\nTask:\n- [Describe the task you want the AI to perform]",
+    "dependencyGraph": {
+      "nodes": [
+        "msisdn/tasks.py",
+        "regular_campaign/retry.py",
+        "regular_campaign/tasks.py",
+        "reports/tasks.py",
+        "scheduler.py",
+        "worker.py",
+        "core/worker_bootstrap.py",
+        "faststream_app.py",
+        "regular_campaign/workflow.py",
+        "core/batching.py",
+        "regular_campaign/constants.py",
+        "__init__.py"
+      ],
+      "edges": []
+    },
+    "optimizationStats": {
+      "originalTokens": 6930,
+      "optimizedTokens": 6910,
+      "tokensSaved": 20,
+      "savingsPercent": 0,
+      "truncatedFiles": [],
+      "commentsRemoved": 2,
+      "docstringsRemoved": 0
+    }
+  }
+}
